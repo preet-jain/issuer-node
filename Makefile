@@ -1,4 +1,5 @@
-include .env-api
+# include .env-api
+SHELL := /bin/bash
 BIN := $(shell pwd)/bin
 VERSION ?= $(shell git rev-parse --short HEAD)
 GO?=$(shell which go)
@@ -27,11 +28,11 @@ build-local:
 build/docker: ## Build the docker image.
 	DOCKER_BUILDKIT=1 \
 	docker build \
-		-f ./Dockerfile \
-		-t issuer/api:$(VERSION) \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg BUILD_DATE=`date -u +"%Y-%m-%dT%H:%M:%SZ"` \
-		.
+					-f ./Dockerfile \
+					-t issuer/api:$(VERSION) \
+					--build-arg VERSION=$(VERSION) \
+					--build-arg BUILD_DATE=`date -u +"%Y-%m-%dT%H:%M:%SZ"` \
+					.
 
 .PHONY: clean
 clean: ## Go clean
@@ -71,8 +72,10 @@ run:
 
 .PHONY: run-arm
 run-arm:
-	@echo "WARN: Running ARM version is deprecated. 'make run' will be executed instead."
-	@make run
+	$(eval DELETE_FILE = $(shell if [ -f ./.env-ui ]; then echo "false"; else echo "true"; fi))
+	@if [ -f ./.env-ui ]; then echo "false"; else touch ./.env-ui; fi
+	COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_FILE="Dockerfile-arm" $(DOCKER_COMPOSE_CMD) up -d api pending_publisher
+	@if [ $(DELETE_FILE) = "true" ] ; then rm ./.env-ui; fi
 
 .PHONY: run-ui
 run-ui: add-host-url-swagger
@@ -80,17 +83,15 @@ run-ui: add-host-url-swagger
 
 .PHONY: run-ui-arm
 run-ui-arm: add-host-url-swagger
-	@echo "WARN: Running ARM version is deprecated. 'make run-ui' will be executed instead."
-	@make run-ui
-	
+	COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_FILE="Dockerfile-arm" $(DOCKER_COMPOSE_CMD) up -d api-ui ui notifications pending_publisher
+
 .PHONY: build
 build:
 	COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_FILE="Dockerfile" $(DOCKER_COMPOSE_CMD) build api pending_publisher
 
 .PHONY: build-arm
 build-arm:
-	@echo "WARN: Running ARM version is deprecated. 'make build' will be executed instead."
-	@make build
+	COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_FILE="Dockerfile-arm" $(DOCKER_COMPOSE_CMD) build api pending_publisher
 
 .PHONY: build-ui
 build-ui:
@@ -98,8 +99,7 @@ build-ui:
 
 .PHONY: build-ui-arm
 build-ui-arm:
-	@echo "WARN: Running ARM version is deprecated. 'make build-ui' will be executed instead."
-	@make build-ui
+	COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_FILE="Dockerfile-arm" $(DOCKER_COMPOSE_CMD) build api-ui ui notifications pending_publisher
 
 .PHONY: down
 down:
@@ -140,7 +140,7 @@ db/migrate: $(BIN)/install-goose $(BIN)/godotenv $(BIN)/platformid-migrate ## In
 
 .PHONY: lint
 lint: $(BIN)/golangci-lint
-	  $(BIN)/golangci-lint run
+	$(BIN)/golangci-lint run
 
 # usage: make private_key=xxx add-private-key
 .PHONY: add-private-key
@@ -168,73 +168,141 @@ run-initializer:
 
 .PHONY: generate-issuer-did
 generate-issuer-did: run-initializer
-	docker logs issuer-initializer-1
 	$(eval DID = $(shell docker logs -f --tail 1 issuer-initializer-1 | grep "did"))
 	@echo $(DID)
 	sed '/ISSUER_API_UI_ISSUER_DID/d' .env-api > .env-api.tmp
 	@echo ISSUER_API_UI_ISSUER_DID=$(DID) >> .env-api.tmp
 	mv .env-api.tmp .env-api
-	docker stop issuer-initializer-1
+	docker logs issuer-initializer-1
 	docker rm issuer-initializer-1
 
+.PHONY: run-initializer-arm
+run-initializer-arm:
+	COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_FILE="Dockerfile-arm" $(DOCKER_COMPOSE_CMD) up -d initializer
+	sleep 5
 
 .PHONY: generate-issuer-did-arm
-generate-issuer-did-arm:
-	@echo "WARN: Running ARM version is deprecated. 'make generate-issuer-did' will be executed instead."
-	@make generate-issuer-did
+generate-issuer-did-arm: run-initializer-arm
+	$(eval DID = $(shell docker logs -f --tail 1 issuer-initializer-1 | grep "did"))
+	@echo $(DID)
+	sed '/ISSUER_API_UI_ISSUER_DID/d' .env-api > .env-api.tmp
+	@echo ISSUER_API_UI_ISSUER_DID=$(DID) >> .env-api.tmp
+	mv .env-api.tmp .env-api
+	docker logs issuer-initializer-1
+	docker rm issuer-initializer-1
 
 .PHONY: add-host-url-swagger
 add-host-url-swagger:
 	@if [ $(ENVIRONMENT) != "" ] && [ $(ENVIRONMENT) != "local" ]; then \
-		sed -i -e  "s#server-url = [^ ]*#server-url = \""${ISSUER_API_UI_SERVER_URL}"\"#g" api_ui/spec.html; \
+					sed -i -e  "s#server-url = [^ ]*#server-url = \""${ISSUER_API_UI_SERVER_URL}"\"#g" api_ui/spec.html; \
 	fi
 
 .PHONY: rm-issuer-imgs
 rm-issuer-imgs: stop
-	$(DOCKER_COMPOSE_CMD) rm -f
-	docker rmi -f issuer-api issuer-ui issuer-api-ui issuer-pending_publisher
+	docker rmi -f issuer-api issuer-ui issuer-api-ui issuer-pending_publisher|| true
 
 .PHONY: restart-ui
 restart-ui: rm-issuer-imgs up run run-ui
 
 .PHONY: restart-ui-arm
-restart-ui-arm:
-	@echo "WARN: Running ARM version is deprecated. 'make restart-ui' will be executed instead."
-	@make restart-ui
+restart-ui-arm: rm-issuer-imgs up run-arm run-ui-arm
 
-.PHONY: print-did
-print-did:
+.PHONY: trigon-issuer-env
+trigon-issuer-env:
+	@echo "Creating .env.trigon-issuer.temp file..."
+	@rm -f .env.trigon-issuer.temp
+	@touch .env.trigon-issuer.temp
+
+	@for variable in ISSUER_API_AUTH_USER ISSUER_ETHEREUM_URL ISSUER_DATABASE_URL ISSUER_REDIS_URL ISSUER_KEY_STORE_ADDRESS ISSUER_SERVER_URL; do \
+		read -p "Enter value for $$variable: " value; \
+		echo "$$variable=$$value" >> .env.trigon-issuer.temp; \
+		echo "$$variable added to .env.trigon-issuer.temp file."; \
+	done
+
+	@while true; do \
+		read -s -p "Enter password for ISSUER_API_AUTH_USER: " password; \
+		echo; \
+		read -p "Confirm password: " password_confirm; \
+		echo; \
+		if [ "$$password" = "$$password_confirm" ]; then \
+			echo "ISSUER_API_AUTH_PASSWORD=$$password" >> .env.trigon-issuer.temp; \
+			echo "ISSUER_API_AUTH_PASSWORD added to .env.trigon-issuer.temp file."; \
+			break; \
+		else \
+			echo "Passwords do not match. Please try again."; \
+		fi; \
+	done
+
+	@echo "Combining values from .env.trigon-issuer.base..."
+	@cat .env.trigon-issuer.base >> .env.trigon-issuer.temp
+	@echo "Values from .env.trigon-issuer.base combined with user inputs."
+
+	@echo "Renaming .env.trigon-issuer.temp file to .env.trigon-issuer..."
+	@mv .env.trigon-issuer.temp .env.trigon-issuer
+	@echo ".env.trigon-issuer.temp file renamed to .env.trigon-issuer. Exiting."
+
+
+# Add the code for generating a did and 
+# adding it to the .env.trigon-api.temp file
+# After user inputs are done
+.PHONY: trigon-api-env
+trigon-api-env:
+	@echo "Creating .env.trigon-api.temp file..."
+	@rm -f .env.trigon-api.temp
+	@touch .env.trigon-api.temp
+
+	@for variable in ISSUER_API_UI_AUTH_USER ISSUER_API_UI_SERVER_URL ISSUER_API_UI_SERVER_PORT ISSUER_API_UI_ISSUER_NAME ISSUER_API_UI_ISSUER_LOGO; do \
+		read -p "Enter value for $$variable: " value; \
+		echo "$$variable=$$value" >> .env.trigon-api.temp; \
+		echo "$$variable added to .env.trigon-api.temp file."; \
+	done
+
+	@while true; do \
+		read -s -p "Enter password for ISSUER_API_UI_AUTH_USER: " password; \
+		echo; \
+		read -p "Confirm password: " password_confirm; \
+		echo; \
+		if [ "$$password" = "$$password_confirm" ]; then \
+			echo "ISSUER_API_UI_AUTH_PASSWORD=$$password" >> .env.trigon-api.temp; \
+			echo "ISSUER_API_UI_AUTH_PASSWORD added to .env.trigon-api.temp file."; \
+			break; \
+		else \
+			echo "Passwords do not match. Please try again."; \
+		fi; \
+	done
+
+
+	@echo "Combining values from .env.trigon-api.base..."
+	@cat .env.trigon-api.base >> .env.trigon-api.temp
+	@echo "Values from .env.trigon-api.base combined with user inputs."
+
+	@echo "Renaming .env.trigon-api.temp file to .env.trigon-api..."
+	@mv .env.trigon-api.temp .env.trigon-api.ui
+	@echo ".env.trigon-api.temp file renamed to .env.trigon-api. Exiting."
+
+
+# usage: make private_key=xxx trigon-run
+.PHONY: trigon-run
+trigon-run:
+	@echo "Setting up docker containers for redis postgres vault"
+	$(DOCKER_COMPOSE_INFRA_CMD) up -d redis postgres vault
+
+	@echo "Adding vault token"
+	$(eval TOKEN = $(shell docker logs issuer-vault-1 2>&1 | grep " .hvs" | awk  '{print $$2}' | tail -1 ))
+	sed '/ISSUER_KEY_STORE_TOKEN/d' .env-issuer > .env-issuer.tmp
+	@echo ISSUER_KEY_STORE_TOKEN=$(TOKEN) >> .env-issuer.tmp
+	mv .env-issuer.tmp .env-issuer
+
+	@echo "Adding privatekey to vault"
 	docker exec issuer-vault-1 \
-	vault kv get -mount=kv did
+	vault write iden3/import/pbkey key_type=ethereum private_key=$(private_key)
 
-# use this to delete the did from vault. It will not be deleted from the database
-.PHONY: delete-did
-delete-did:
-	docker exec issuer-vault-1 \
-	vault kv delete kv/did
+	@echo "Building local"
+	$(BUILD_CMD) ./cmd/...
 
-# use this to add the did to vault. It will not be added to the database
-# usage: make did=xxx add-did
-.PHONY: add-did
-add-did:
-	docker exec issuer-vault-1 \
-	vault kv put kv/did did=$(did)
+	@echo "Setting up DB"
+	$(BIN)/install-goose $(BIN)/godotenv $(BIN)/platformid-migrate ## Install goose and apply migrations.
+	$(ENV) sh -c '$(BIN)/migrate'
 
-# usage: make vault_token=xxx vault-export-keys
-.PHONY: vault-export-keys
-vault-export-keys:
-	docker build -t issuer-vault-export-keys .
-	docker run --rm -it --network=issuer-network -v $(shell pwd):/keys issuer-vault-export-keys ./vault-migrator -operation=export -output-file=keys.json -vault-token=$(vault_token) -vault-addr=http://vault:8200
-
-# usage: make vault_token=xxx vault-import-keys
-.PHONY: vault-import-keys
-vault-import-keys:
-	docker build -t issuer-vault-import-keys .
-	docker run --rm -it --network=issuer-network -v $(shell pwd)/keys.json:/keys.json issuer-vault-import-keys ./vault-migrator -operation=import -input-file=keys.json -vault-token=$(vault_token) -vault-addr=http://vault:8200
-
-
-# usage: make new_password=xxx change-vault-password
-.PHONY: change-vault-password
-change-vault-password:
-	docker exec issuer-vault-1 \
-	vault write auth/userpass/users/issuernode password=$(new_password)
+	@echo "Starting the issuer node"
+	$(ENV) sh -c '$(BIN)/platform'
